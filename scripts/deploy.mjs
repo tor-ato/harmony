@@ -25,6 +25,19 @@ console.log(`Promoting ${version} to 100%...`);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// `wrangler deploy` usually puts the new version at 100% by itself; the
+// explicit promotion below only exists for the cases where it does not.
+// Check first so a successful deploy does not spend two minutes retrying a
+// promotion that the API refuses for an already-active version.
+const status = run(["wrangler", "deployments", "status"], { encoding: "utf8" });
+const active = `${status.stdout ?? ""}\n${status.stderr ?? ""}`.match(
+  /\(100%\)\s*([0-9a-f-]{36})/i,
+);
+if (status.status === 0 && active && active[1] === version) {
+  console.log(`Already at 100%: ${version}`);
+  process.exit(0);
+}
+
 for (let attempt = 1; attempt <= 12; attempt += 1) {
   const promote = run(
     [
