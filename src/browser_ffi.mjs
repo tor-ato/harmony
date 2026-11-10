@@ -334,66 +334,43 @@ export async function render_system_crops(pageNumber, number, indices, bars) {
       const sourceBottom = Math.min(source.height, Math.ceil(bottom * scale));
       const height = Math.max(20, sourceBottom - sourceTop);
 
-      // Split wide systems into left/right tiles with a 20% overlap so that
-      // each tile keeps enough resolution and shares two bars of context.
-      const split = source.width > 1400;
-      const tileWidth = Math.floor(source.width * 0.6);
-      const tiles = split
-        ? [
-            { side: "左", sx: 0, sw: tileWidth },
-            {
-              side: "右",
-              sx: source.width - tileWidth,
-              sw: tileWidth,
-            },
-          ]
-        : [{ side: "", sx: 0, sw: source.width }];
-
-      let rangeLabel = "";
+      // Send one full system per request. The row is cut from the page at
+      // native page resolution, so a single tile keeps the same pixels per bar
+      // as a left/right split while avoiding duplicated bars, doubled requests
+      // and bar-number drift between overlapping crops.
+      let barRange = "";
       if (barCount > 0) {
         const startBar = cumulativeBars + 1;
         const endBar = cumulativeBars + barCount;
-        const middle = Math.ceil(barCount / 2);
-        const leftEnd = Math.min(endBar, startBar + middle);
-        const rightStart = Math.max(startBar, startBar + middle - 1);
-        rangeLabel = ` / 小節${startBar}-${endBar}`;
-        tiles[0].barRange =
-          startBar === leftEnd ? `小節${startBar}` : `小節${startBar}-${leftEnd}`;
-        if (tiles.length > 1) {
-          tiles[1].barRange =
-            rightStart === endBar
-              ? `小節${endBar}`
-              : `小節${rightStart}-${endBar}`;
-        }
+        barRange =
+          startBar === endBar
+            ? `小節${startBar}`
+            : `小節${startBar}-${endBar}`;
       }
 
-      for (const tile of tiles) {
-        const canvas = document.createElement("canvas");
-        canvas.width = tile.sw;
-        canvas.height = height;
-        const context = canvas.getContext("2d", { alpha: false });
-        context.fillStyle = "#ffffff";
-        context.fillRect(0, 0, canvas.width, canvas.height);
-        context.drawImage(
-          source,
-          tile.sx,
-          sourceTop,
-          tile.sw,
-          height,
-          0,
-          0,
-          tile.sw,
-          height,
-        );
+      const canvas = document.createElement("canvas");
+      canvas.width = source.width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: false });
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(
+        source,
+        0,
+        sourceTop,
+        source.width,
+        height,
+        0,
+        0,
+        source.width,
+        height,
+      );
 
-        const barPart = tile.barRange ? ` / ${tile.barRange}` : rangeLabel;
-        const sidePart = tile.side === "" ? "" : `（${tile.side}）`;
-        const label = `No.${number} / 段${index}${barPart}${sidePart}`;
-        parts.push({
-          label,
-          data_url: canvas.toDataURL("image/jpeg", 0.9),
-        });
-      }
+      const category = barRange === "" ? `段${index}` : `段${index} / ${barRange}`;
+      parts.push({
+        label: `No.${number} / ${category}`,
+        data_url: canvas.toDataURL("image/jpeg", 0.9),
+      });
 
       cumulativeBars += barCount;
     }

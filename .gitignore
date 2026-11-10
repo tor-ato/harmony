@@ -13,3 +13,6 @@ assets/pdf.worker.min.mjs
 # deployment credentials / generated state
 .cf-api-token
 .access-setup.json
+
+# local model credentials
+.gemini-api-key

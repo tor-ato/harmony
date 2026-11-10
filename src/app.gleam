@@ -1309,7 +1309,7 @@ fn view_transcribing(model: Model) -> Element(Msg) {
       ),
     ]),
     html.p([attribute.class("muted small")], [
-      html.text("対象曲の段を分割して送信します。1ページあたり数十秒かかることがあります。"),
+      html.text("対象曲の段ごとに画像を作って送信します。1ページあたり数十秒かかることがあります。"),
     ]),
   ])
 }
