@@ -1,0 +1,22 @@
+{
+  "name": "harmony",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
+    "build:worker": "gleam build",
+    "build": "npm run build:worker && npm run build:ui",
+    "dev": "wrangler dev",
+    "deploy": "npm run build && node scripts/deploy.mjs",
+    "setup:access": "node scripts/setup-access.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply harmony --local",
+    "db:migrate": "wrangler d1 migrations apply harmony --remote"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^6.5.438"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.0",
+    "wrangler": "^4.158.0"
+  }
+}

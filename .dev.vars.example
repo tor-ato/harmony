@@ -1,0 +1,10 @@
+# Local-only auth bypass. Never set this in production.
+# ALLOWED_EMAILS must include DEV_EMAIL for the bypass to be accepted.
+ALLOWED_EMAILS=you@example.com,friend@example.com
+DEV_EMAIL=you@example.com
+
+# Return deterministic mock analysis without calling the model.
+MOCK_LLM=true
+
+# For real analysis set MOCK_LLM=false and provide an OpenCode Console key.
+# DEEPSEEK_API_KEY=sk-...

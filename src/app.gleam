@@ -1,0 +1,1522 @@
+//// Lustre single-page app: targeted piece location, transcription, review,
+//// and per-piece harmony results.
+
+import browser
+import gleam/int
+import gleam/javascript/promise
+import gleam/json
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/string
+import lustre
+import lustre/attribute
+import lustre/effect.{type Effect}
+import lustre/element.{type Element}
+import lustre/element/html
+import lustre/event
+import shared
+
+const app_version = "2026-11-10.4"
+
+// MODEL -----------------------------------------------------------------------
+
+pub type Stage {
+  Selecting
+  Locating
+  Located
+  Transcribing
+  Analyzing
+  Done
+  Failed
+}
+
+pub type TargetStatus {
+  Pending
+  TargetTranscribing
+  Transcribed
+  TargetAnalyzing
+  TargetDone
+  FailedTarget
+  Missing
+  QuotaExceeded
+}
+
+pub type TargetPage {
+  TargetPage(page: Int, systems: List(Int), bars: List(Int))
+}
+
+pub type Target {
+  Target(
+    number: String,
+    pages: List(TargetPage),
+    text: String,
+    status: TargetStatus,
+    analysis: Option(shared.Analysis),
+    error: String,
+  )
+}
+
+pub type Model {
+  Model(
+    stage: Stage,
+    error: String,
+    info: Option(shared.PdfInfo),
+    selected: List(Int),
+    target_input: String,
+    targets: List(Target),
+    locate_targets: List(String),
+    locate_pages: List(Int),
+    locate_results: List(#(Int, shared.LocateResult)),
+    locate_active: Option(Int),
+    transcribe_queue: List(#(String, Int)),
+    transcribe_total: Int,
+    transcribe_done: Int,
+    transcribe_active: Option(#(String, Int)),
+    analyze_queue: List(String),
+    analyze_total: Int,
+    analyze_done: Int,
+    active_target: Option(String),
+    quota: Option(shared.Quota),
+  )
+}
+
+fn initial_model() -> Model {
+  Model(
+    stage: Selecting,
+    error: "",
+    info: None,
+    selected: [],
+    target_input: "",
+    targets: [],
+    locate_targets: [],
+    locate_pages: [],
+    locate_results: [],
+    locate_active: None,
+    transcribe_queue: [],
+    transcribe_total: 0,
+    transcribe_done: 0,
+    transcribe_active: None,
+    analyze_queue: [],
+    analyze_total: 0,
+    analyze_done: 0,
+    active_target: None,
+    quota: None,
+  )
+}
+
+// MESSAGES --------------------------------------------------------------------
+
+pub type Msg {
+  FileChosen
+  PdfLoaded(Result(String, String))
+  TogglePage(Int)
+  SelectAll
+  ClearSelection
+  TargetInputChanged(String)
+  BeginLocate
+  LocatePageFinished(Int, Result(String, String))
+  BackToSelecting
+  BeginTranscription
+  PageTranscribed(String, Int, Result(String, String))
+  TargetAnalyzed(String, Result(String, String))
+  QuotaReceived(Result(String, String))
+  Reset
+  Print
+}
+
+// UPDATE ----------------------------------------------------------------------
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    FileChosen -> #(model, load_pdf_effect())
+
+    PdfLoaded(result) -> handle_pdf_loaded(model, result)
+
+    TogglePage(page) -> {
+      let selected = case list.contains(model.selected, page) {
+        True -> list.filter(model.selected, fn(item) { item != page })
+        False -> [page, ..model.selected]
+      }
+      #(Model(..model, selected:), effect.none())
+    }
+
+    SelectAll ->
+      case model.info {
+        Some(info) -> #(
+          Model(
+            ..model,
+            selected: list.map(info.thumbs, fn(thumb) { thumb.page }),
+          ),
+          effect.none(),
+        )
+        None -> #(model, effect.none())
+      }
+
+    ClearSelection -> #(Model(..model, selected: []), effect.none())
+
+    TargetInputChanged(value) -> #(
+      Model(..model, target_input: value),
+      effect.none(),
+    )
+
+    BeginLocate -> begin_locate(model)
+
+    LocatePageFinished(page, result) ->
+      handle_locate_finished(model, page, result)
+
+    BackToSelecting -> #(
+      Model(
+        ..model,
+        stage: Selecting,
+        targets: [],
+        locate_results: [],
+        error: "",
+      ),
+      effect.none(),
+    )
+
+    BeginTranscription -> begin_transcription(model)
+
+    PageTranscribed(number, page, result) ->
+      handle_page_transcribed(model, number, page, result)
+
+    TargetAnalyzed(number, result) ->
+      handle_target_analyzed(model, number, result)
+
+    QuotaReceived(result) -> handle_quota(model, result)
+
+    Reset -> #(initial_model(), reset_effect())
+
+    Print -> #(model, print_effect())
+  }
+}
+
+fn handle_pdf_loaded(
+  model: Model,
+  result: Result(String, String),
+) -> #(Model, Effect(Msg)) {
+  case result {
+    Error(message) -> #(
+      Model(..model, stage: Failed, error: message),
+      effect.none(),
+    )
+    Ok(raw) ->
+      case json.parse(raw, shared.pdf_info_decoder()) {
+        Error(_) -> #(
+          Model(..model, stage: Failed, error: "PDF の情報を読めませんでした"),
+          effect.none(),
+        )
+        Ok(info) -> {
+          let selected = list.map(info.thumbs, fn(thumb) { thumb.page })
+          #(
+            Model(
+              ..model,
+              stage: Selecting,
+              info: Some(info),
+              selected:,
+              targets: [],
+              error: "",
+            ),
+            quota_effect(),
+          )
+        }
+      }
+  }
+}
+
+// LOCATE ----------------------------------------------------------------------
+
+fn begin_locate(model: Model) -> #(Model, Effect(Msg)) {
+  let targets = parse_targets(model.target_input)
+
+  case model.info, model.selected, targets {
+    Some(_), [], _ -> #(
+      Model(..model, error: "ページを1つ以上選択してください"),
+      effect.none(),
+    )
+    _, _, [] -> #(Model(..model, error: "分析する曲番号を入力してください"), effect.none())
+    Some(_), pages, targets -> {
+      let model =
+        Model(
+          ..model,
+          stage: Locating,
+          error: "",
+          locate_targets: targets,
+          locate_pages: pages,
+          locate_results: [],
+          locate_active: None,
+          targets: [],
+        )
+      locate_next(model)
+    }
+    None, _, _ -> #(
+      Model(..model, stage: Failed, error: "PDF が読み込まれていません"),
+      effect.none(),
+    )
+  }
+}
+
+fn locate_next(model: Model) -> #(Model, Effect(Msg)) {
+  case model.info, model.locate_pages {
+    Some(info), [page, ..rest] -> #(
+      Model(..model, locate_pages: rest, locate_active: Some(page)),
+      locate_page_effect(page, info.doc_id, model.locate_targets),
+    )
+    Some(_), [] -> finish_locate(model)
+    None, _ -> #(
+      Model(..model, stage: Failed, error: "PDF が読み込まれていません"),
+      effect.none(),
+    )
+  }
+}
+
+fn handle_locate_finished(
+  model: Model,
+  page: Int,
+  result: Result(String, String),
+) -> #(Model, Effect(Msg)) {
+  case result {
+    Error(message) -> #(
+      Model(..model, stage: Failed, error: message, locate_active: None),
+      effect.none(),
+    )
+    Ok(raw) ->
+      case shared.parse_api_response(raw) {
+        Error(message) -> #(
+          Model(..model, stage: Failed, error: message, locate_active: None),
+          effect.none(),
+        )
+        Ok(api) ->
+          case api.ok {
+            False -> #(
+              Model(
+                ..model,
+                stage: Failed,
+                error: api.error,
+                locate_active: None,
+              ),
+              effect.none(),
+            )
+            True ->
+              case json.parse(api.body, shared.locate_result_decoder()) {
+                Error(_) -> #(
+                  Model(
+                    ..model,
+                    stage: Failed,
+                    error: "ロケート結果を読めませんでした",
+                    locate_active: None,
+                  ),
+                  effect.none(),
+                )
+                Ok(located) -> {
+                  let model =
+                    Model(
+                      ..model,
+                      locate_results: [#(page, located), ..model.locate_results],
+                      locate_active: None,
+                    )
+                  locate_next(model)
+                }
+              }
+          }
+      }
+  }
+}
+
+fn finish_locate(model: Model) -> #(Model, Effect(Msg)) {
+  let targets =
+    model.locate_targets
+    |> list.map(fn(number) {
+      let pages =
+        model.locate_results
+        |> list.filter_map(fn(result) {
+          let #(page, located) = result
+          case list.find(located.found, fn(found) { found.number == number }) {
+            Ok(found) ->
+              Ok(TargetPage(
+                page:,
+                systems: found.systems,
+                bars: usable_bars(found),
+              ))
+            Error(_) -> Error(Nil)
+          }
+        })
+        |> list.sort(fn(a, b) { int.compare(a.page, b.page) })
+
+      case pages {
+        [] ->
+          Target(
+            number:,
+            pages: [],
+            text: "",
+            status: Missing,
+            analysis: None,
+            error: "",
+          )
+        _ ->
+          Target(
+            number:,
+            pages:,
+            text: "",
+            status: Pending,
+            analysis: None,
+            error: "",
+          )
+      }
+    })
+
+  let found =
+    list.filter(targets, fn(target) {
+      case target.status {
+        Missing -> False
+        _ -> True
+      }
+    })
+
+  case list.length(found) {
+    0 -> #(
+      Model(..model, stage: Failed, targets:, error: "指定した番号が選択ページに見つかりませんでした"),
+      effect.none(),
+    )
+    _ -> #(Model(..model, stage: Located, targets:), effect.none())
+  }
+}
+
+// TRANSCRIBE ------------------------------------------------------------------
+
+fn begin_transcription(model: Model) -> #(Model, Effect(Msg)) {
+  let queue =
+    model.targets
+    |> list.filter(fn(target) {
+      case target.status {
+        Missing -> False
+        _ -> True
+      }
+    })
+    |> list.flat_map(fn(target) {
+      list.map(target.pages, fn(page) { #(target.number, page.page) })
+    })
+
+  case queue {
+    [] -> #(Model(..model, error: "書き起こす対象がありません"), effect.none())
+    _ -> {
+      let next_model =
+        Model(
+          ..model,
+          stage: Transcribing,
+          error: "",
+          targets: list.map(model.targets, fn(target) {
+            case target.status {
+              Missing -> target
+              _ -> Target(..target, status: Pending, text: "")
+            }
+          }),
+          transcribe_queue: queue,
+          transcribe_total: list.length(queue),
+          transcribe_done: 0,
+          transcribe_active: None,
+        )
+      transcribe_next(next_model)
+    }
+  }
+}
+
+fn transcribe_next(model: Model) -> #(Model, Effect(Msg)) {
+  case model.info, model.transcribe_queue {
+    Some(info), [#(number, page), ..rest] -> {
+      let systems = target_systems(model.targets, number, page)
+      let bars = target_bars(model.targets, number, page)
+      #(
+        Model(
+          ..model,
+          transcribe_queue: rest,
+          transcribe_active: Some(#(number, page)),
+          targets: update_target(model.targets, number, fn(target) {
+            Target(..target, status: TargetTranscribing)
+          }),
+        ),
+        transcribe_page_effect(page, number, systems, bars, info.doc_id),
+      )
+    }
+    Some(_), [] -> {
+      let targets =
+        list.map(model.targets, fn(target) {
+          case target.status {
+            Missing -> target
+            _ -> Target(..target, status: Transcribed)
+          }
+        })
+      begin_analysis(Model(..model, transcribe_active: None, targets:))
+    }
+    None, _ -> #(
+      Model(..model, stage: Failed, error: "PDF が読み込まれていません"),
+      effect.none(),
+    )
+  }
+}
+
+fn handle_page_transcribed(
+  model: Model,
+  number: String,
+  page: Int,
+  result: Result(String, String),
+) -> #(Model, Effect(Msg)) {
+  case result {
+    Error(message) -> #(
+      Model(..model, stage: Failed, error: message, transcribe_active: None),
+      effect.none(),
+    )
+    Ok(raw) ->
+      case shared.parse_api_response(raw) {
+        Error(message) -> #(
+          Model(..model, stage: Failed, error: message, transcribe_active: None),
+          effect.none(),
+        )
+        Ok(api) ->
+          case api.ok {
+            False -> #(
+              Model(
+                ..model,
+                stage: Failed,
+                error: api.error,
+                transcribe_active: None,
+              ),
+              effect.none(),
+            )
+            True ->
+              case json.parse(api.body, shared.page_text_decoder()) {
+                Error(_) -> #(
+                  Model(
+                    ..model,
+                    stage: Failed,
+                    error: "書き起こしを読めませんでした",
+                    transcribe_active: None,
+                  ),
+                  effect.none(),
+                )
+                Ok(shared.PageText(text: text)) -> {
+                  let targets =
+                    update_target(model.targets, number, fn(target) {
+                      let section =
+                        "【ページ " <> int.to_string(page) <> "】\n" <> text
+                      let text = case string.trim(target.text) {
+                        "" -> section
+                        _ -> target.text <> "\n\n" <> section
+                      }
+                      Target(..target, text:, status: TargetTranscribing)
+                    })
+
+                  let done = model.transcribe_done + 1
+                  let model =
+                    Model(
+                      ..model,
+                      targets:,
+                      transcribe_done: done,
+                      transcribe_active: None,
+                    )
+                  case model.transcribe_queue {
+                    [] -> transcribe_next(Model(..model, transcribe_queue: []))
+                    _ -> transcribe_next(model)
+                  }
+                }
+              }
+          }
+      }
+  }
+}
+
+// ANALYZE ---------------------------------------------------------------------
+
+fn begin_analysis(model: Model) -> #(Model, Effect(Msg)) {
+  let queue =
+    model.targets
+    |> list.filter(fn(target) {
+      case target.status {
+        Missing -> False
+        _ -> !string.is_empty(string.trim(target.text))
+      }
+    })
+    |> list.map(fn(target) { target.number })
+
+  case queue {
+    [] -> #(Model(..model, error: "分析できる書き起こしがありません"), effect.none())
+    _ -> {
+      let model =
+        Model(
+          ..model,
+          stage: Analyzing,
+          error: "",
+          analyze_queue: queue,
+          analyze_total: list.length(queue),
+          analyze_done: 0,
+          active_target: None,
+          targets: list.map(model.targets, fn(target) {
+            case list.contains(queue, target.number) {
+              True -> Target(..target, status: TargetAnalyzing)
+              False -> target
+            }
+          }),
+        )
+      analyze_next(model)
+    }
+  }
+}
+
+fn analyze_next(model: Model) -> #(Model, Effect(Msg)) {
+  case model.info, model.analyze_queue {
+    Some(info), [number, ..rest] -> {
+      let text = case target_by_number(model.targets, number) {
+        Some(target) -> target.text
+        None -> ""
+      }
+      #(
+        Model(..model, analyze_queue: rest, active_target: Some(number)),
+        analyze_target_effect(number, info.doc_id, text),
+      )
+    }
+    Some(_), [] -> {
+      #(Model(..model, stage: Done, active_target: None), quota_effect())
+    }
+    None, _ -> #(
+      Model(..model, stage: Failed, error: "PDF が読み込まれていません"),
+      effect.none(),
+    )
+  }
+}
+
+fn handle_target_analyzed(
+  model: Model,
+  number: String,
+  result: Result(String, String),
+) -> #(Model, Effect(Msg)) {
+  case result {
+    Error(message) -> {
+      let targets =
+        update_target(model.targets, number, fn(target) {
+          Target(..target, status: FailedTarget, error: message)
+        })
+      continue_analysis(Model(..model, targets:), number)
+    }
+    Ok(raw) ->
+      case shared.parse_api_response(raw) {
+        Error(message) -> {
+          let targets =
+            update_target(model.targets, number, fn(target) {
+              Target(..target, status: FailedTarget, error: message)
+            })
+          continue_analysis(Model(..model, targets:), number)
+        }
+        Ok(api) ->
+          case api.ok {
+            True ->
+              case json.parse(api.body, shared.analysis_decoder()) {
+                Error(_) -> {
+                  let targets =
+                    update_target(model.targets, number, fn(target) {
+                      Target(
+                        ..target,
+                        status: FailedTarget,
+                        error: "分析結果を読めませんでした",
+                      )
+                    })
+                  continue_analysis(Model(..model, targets:), number)
+                }
+                Ok(analysis) -> {
+                  let targets =
+                    update_target(model.targets, number, fn(target) {
+                      Target(
+                        ..target,
+                        status: TargetDone,
+                        analysis: Some(analysis),
+                        error: "",
+                      )
+                    })
+                  continue_analysis(Model(..model, targets:), number)
+                }
+              }
+            False ->
+              case api.status {
+                429 -> {
+                  let remaining = model.analyze_queue
+                  let targets =
+                    model.targets
+                    |> update_target(number, fn(target) {
+                      Target(..target, status: QuotaExceeded, error: api.error)
+                    })
+                    |> update_many(remaining, fn(target) {
+                      Target(..target, status: QuotaExceeded, error: api.error)
+                    })
+                  #(
+                    Model(
+                      ..model,
+                      stage: Done,
+                      targets:,
+                      analyze_queue: [],
+                      active_target: None,
+                      error: api.error,
+                    ),
+                    quota_effect(),
+                  )
+                }
+                _ -> {
+                  let targets =
+                    update_target(model.targets, number, fn(target) {
+                      Target(..target, status: FailedTarget, error: api.error)
+                    })
+                  continue_analysis(Model(..model, targets:), number)
+                }
+              }
+          }
+      }
+  }
+}
+
+fn continue_analysis(model: Model, _number: String) -> #(Model, Effect(Msg)) {
+  let done = model.analyze_done + 1
+  let model = Model(..model, analyze_done: done, active_target: None)
+  analyze_next(model)
+}
+
+// HELPERS ---------------------------------------------------------------------
+
+fn parse_targets(input: String) -> List(String) {
+  input
+  |> string.replace("、", ",")
+  |> string.replace(" ", ",")
+  |> string.split(",")
+  |> list.flat_map(fn(part) {
+    let trimmed = string.trim(part)
+    case string.split(trimmed, "-") {
+      [start, end] -> expand_range(start, end)
+      _ -> [trimmed]
+    }
+  })
+  |> list.filter_map(fn(value) {
+    case normalize_number(value) {
+      Some(number) -> Ok(number)
+      None -> Error(Nil)
+    }
+  })
+  |> list.unique
+}
+
+fn expand_range(start: String, end: String) -> List(String) {
+  case int.parse(string.trim(start)), int.parse(string.trim(end)) {
+    Ok(first), Ok(last) ->
+      case first > 0 && last >= first && last - first <= 20 {
+        True -> range_numbers(first, last)
+        False -> []
+      }
+    _, _ -> []
+  }
+}
+
+fn range_numbers(first: Int, last: Int) -> List(String) {
+  case first > last {
+    True -> []
+    False -> [int.to_string(first), ..range_numbers(first + 1, last)]
+  }
+}
+
+fn normalize_number(value: String) -> Option(String) {
+  let cleaned =
+    value
+    |> string.trim
+    |> string.replace("No.", "")
+    |> string.replace("no.", "")
+    |> string.replace("#", "")
+    |> string.trim
+
+  case int.parse(cleaned) {
+    Ok(number) ->
+      case number > 0 {
+        True -> Some(int.to_string(number))
+        False -> None
+      }
+    Error(_) -> None
+  }
+}
+
+fn target_by_number(targets: List(Target), number: String) -> Option(Target) {
+  case list.find(targets, fn(target) { target.number == number }) {
+    Ok(target) -> Some(target)
+    Error(_) -> None
+  }
+}
+
+fn target_systems(
+  targets: List(Target),
+  number: String,
+  page: Int,
+) -> List(Int) {
+  case target_page(targets, number, page) {
+    Some(target_page) -> target_page.systems
+    None -> []
+  }
+}
+
+fn target_bars(targets: List(Target), number: String, page: Int) -> List(Int) {
+  case target_page(targets, number, page) {
+    Some(target_page) -> target_page.bars
+    None -> []
+  }
+}
+
+fn target_page(
+  targets: List(Target),
+  number: String,
+  page: Int,
+) -> Option(TargetPage) {
+  case target_by_number(targets, number) {
+    Some(target) ->
+      case list.find(target.pages, fn(item) { item.page == page }) {
+        Ok(item) -> Some(item)
+        Error(_) -> None
+      }
+    None -> None
+  }
+}
+
+fn update_target(
+  targets: List(Target),
+  number: String,
+  update: fn(Target) -> Target,
+) -> List(Target) {
+  list.map(targets, fn(target) {
+    case target.number == number {
+      True -> update(target)
+      False -> target
+    }
+  })
+}
+
+fn update_many(
+  targets: List(Target),
+  numbers: List(String),
+  update: fn(Target) -> Target,
+) -> List(Target) {
+  list.map(targets, fn(target) {
+    case list.contains(numbers, target.number) {
+      True -> update(target)
+      False -> target
+    }
+  })
+}
+
+fn usable_bars(found: shared.FoundTarget) -> List(Int) {
+  let total = list.fold(found.bars, 0, int.add)
+  case total > 0 && list.length(found.bars) == list.length(found.systems) {
+    True -> found.bars
+    False -> list.map(found.systems, fn(_system) { 8 })
+  }
+}
+
+fn systems_summary(target: Target) -> String {
+  target.pages
+  |> list.map(fn(target_page) {
+    let labels =
+      target_page.systems
+      |> list.map(int.to_string)
+      |> string.join(",")
+    let bars = list.fold(target_page.bars, 0, int.add)
+    let range = case bars > 0 {
+      True -> " 小節1-" <> int.to_string(bars)
+      False -> ""
+    }
+    "p." <> int.to_string(target_page.page) <> " 段" <> labels <> range
+  })
+  |> string.join(" / ")
+}
+
+fn found_count(targets: List(Target)) -> Int {
+  list.filter(targets, fn(target) {
+    case target.status {
+      Missing -> False
+      _ -> True
+    }
+  })
+  |> list.length
+}
+
+// EFFECTS ---------------------------------------------------------------------
+
+fn load_pdf_effect() -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    let _ =
+      browser.load_pdf()
+      |> promise.map(fn(result) { dispatch(PdfLoaded(result)) })
+    Nil
+  })
+}
+
+fn quota_effect() -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    let _ =
+      browser.api_get("/api/quota")
+      |> promise.map(fn(result) { dispatch(QuotaReceived(result)) })
+    Nil
+  })
+}
+
+fn reset_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) {
+    browser.reset_pdf()
+    Nil
+  })
+}
+
+fn print_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) {
+    browser.print_page()
+    Nil
+  })
+}
+
+fn locate_page_effect(
+  page: Int,
+  doc_id: String,
+  targets: List(String),
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    let work =
+      browser.render_page_overview(page)
+      |> promise.await(fn(rendered) {
+        case rendered {
+          Error(message) -> promise.resolve(Error(message))
+          Ok(raw) ->
+            case json.parse(raw, shared.overview_decoder()) {
+              Error(_) -> promise.resolve(Error("ページ概要を作れませんでした"))
+              Ok(shared.Overview(data_url:, system_count:)) -> {
+                let body =
+                  json.object([
+                    #("doc_id", json.string(doc_id)),
+                    #("page", json.int(page)),
+                    #("image", json.string(data_url)),
+                    #("targets", json.array(targets, json.string)),
+                    #("system_count", json.int(system_count)),
+                  ])
+                  |> json.to_string
+
+                browser.api_post("/api/locate", body)
+              }
+            }
+        }
+      })
+
+    let _ =
+      work
+      |> promise.map(fn(result) { dispatch(LocatePageFinished(page, result)) })
+    Nil
+  })
+}
+
+fn transcribe_page_effect(
+  page: Int,
+  number: String,
+  systems: List(Int),
+  bars: List(Int),
+  doc_id: String,
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    let work =
+      browser.render_system_crops(page, number, systems, bars)
+      |> promise.await(fn(rendered) {
+        case rendered {
+          Error(message) -> promise.resolve(Error(message))
+          Ok(raw) ->
+            case json.parse(raw, shared.render_parts_decoder()) {
+              Error(_) -> promise.resolve(Error("ページ画像を作れませんでした"))
+              Ok(shared.RenderParts(parts: parts)) -> {
+                let json_parts =
+                  list.map(parts, fn(part) {
+                    json.object([
+                      #("label", json.string(part.label)),
+                      #("data_url", json.string(part.data_url)),
+                    ])
+                  })
+
+                let body =
+                  json.object([
+                    #("doc_id", json.string(doc_id)),
+                    #("page", json.int(page)),
+                    #("number", json.string(number)),
+                    #("parts", json.array(json_parts, fn(value) { value })),
+                  ])
+                  |> json.to_string
+
+                browser.api_post("/api/transcribe", body)
+              }
+            }
+        }
+      })
+
+    let _ =
+      work
+      |> promise.map(fn(result) {
+        dispatch(PageTranscribed(number, page, result))
+      })
+    Nil
+  })
+}
+
+fn analyze_target_effect(
+  number: String,
+  doc_id: String,
+  text: String,
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    let body =
+      json.object([
+        #("doc_id", json.string(doc_id)),
+        #("number", json.string(number)),
+        #("text", json.string(text)),
+      ])
+      |> json.to_string
+
+    let _ =
+      browser.api_post("/api/finalize", body)
+      |> promise.map(fn(result) { dispatch(TargetAnalyzed(number, result)) })
+    Nil
+  })
+}
+
+fn handle_quota(
+  model: Model,
+  result: Result(String, String),
+) -> #(Model, Effect(Msg)) {
+  case result {
+    Ok(raw) ->
+      case shared.parse_api_response(raw) {
+        Ok(api) ->
+          case api.ok {
+            True ->
+              case json.parse(api.body, shared.quota_decoder()) {
+                Ok(quota) -> #(
+                  Model(..model, quota: Some(quota)),
+                  effect.none(),
+                )
+                Error(_) -> #(model, effect.none())
+              }
+            False -> #(model, effect.none())
+          }
+        Error(_) -> #(model, effect.none())
+      }
+    Error(_) -> #(model, effect.none())
+  }
+}
+
+// VIEW ------------------------------------------------------------------------
+
+fn view(model: Model) -> Element(Msg) {
+  html.main([attribute.class("app")], [
+    html.header([attribute.class("masthead")], [
+      html.div([attribute.class("brand")], [
+        html.h1([], [html.text("Harmony")]),
+        html.p([attribute.class("tagline")], [
+          html.text("楽譜から、和声分析を"),
+        ]),
+      ]),
+      quota_badge(model.quota),
+    ]),
+    view_error(model),
+    view_body(model),
+    html.footer([attribute.class("footer")], [
+      html.text("Friends beta · 月10回まで · Cloudflare · " <> app_version),
+    ]),
+  ])
+}
+
+fn view_error(model: Model) -> Element(Msg) {
+  case model.error {
+    "" -> html.div([attribute.class("hidden")], [])
+    message ->
+      html.div(
+        [attribute.class("banner banner-error"), attribute.role("alert")],
+        [
+          html.strong([], [html.text("エラー: ")]),
+          html.span([], [html.text(message)]),
+        ],
+      )
+  }
+}
+
+fn quota_badge(quota: Option(shared.Quota)) -> Element(Msg) {
+  case quota {
+    None ->
+      html.div([attribute.class("quota quota-muted")], [
+        html.text("利用回数を確認中"),
+      ])
+    Some(q) ->
+      html.div([attribute.class("quota")], [
+        html.span([attribute.class("quota-label")], [html.text("今月の残り")]),
+        html.strong([], [
+          html.text(
+            int.to_string(q.remaining) <> " / " <> int.to_string(q.limit),
+          ),
+        ]),
+        html.span([attribute.class("quota-month")], [html.text(q.month)]),
+      ])
+  }
+}
+
+fn view_body(model: Model) -> Element(Msg) {
+  case model.stage {
+    Selecting ->
+      case model.info {
+        Some(info) -> view_select(model, info)
+        None -> view_upload()
+      }
+    Locating -> view_locating(model)
+    Located -> view_located(model)
+    Transcribing -> view_transcribing(model)
+    Analyzing -> view_analyzing(model)
+    Done -> view_done(model)
+    Failed -> view_failed(model)
+  }
+}
+
+fn view_upload() -> Element(Msg) {
+  html.section([attribute.class("card upload")], [
+    html.h2([], [html.text("PDF を選択")]),
+    html.p([], [
+      html.text("譜面の PDF を選び、分析したい曲のページを選択してください。"),
+    ]),
+    html.label([attribute.class("file-drop"), attribute.for("pdf-input")], [
+      html.input([
+        attribute.type_("file"),
+        attribute.id("pdf-input"),
+        attribute.accept(["application/pdf"]),
+        attribute.class("file-input"),
+        event.on_change(fn(_value) { FileChosen }),
+      ]),
+      html.span([attribute.class("file-drop-label")], [
+        html.text("PDF ファイルを選択（40MB まで）"),
+      ]),
+    ]),
+    html.p([attribute.class("muted")], [
+      html.text("画像はブラウザ内でページごとに JPEG 化され、DeepSeek に送信されます。元の PDF は保存されません。"),
+    ]),
+  ])
+}
+
+fn view_select(model: Model, info: shared.PdfInfo) -> Element(Msg) {
+  let count = list.length(model.selected)
+
+  html.section([attribute.class("card")], [
+    html.div([attribute.class("section-head")], [
+      html.div([], [
+        html.h2([], [html.text("ページと対象曲を選択")]),
+        html.p([attribute.class("muted")], [
+          html.text(
+            info.name <> " · 全 " <> int.to_string(info.page_count) <> " ページ",
+          ),
+        ]),
+      ]),
+      html.div([attribute.class("toolbar")], [
+        html.button([attribute.type_("button"), event.on_click(SelectAll)], [
+          html.text("すべて選択"),
+        ]),
+        html.button(
+          [attribute.type_("button"), event.on_click(ClearSelection)],
+          [html.text("選択解除")],
+        ),
+        html.button(
+          [
+            attribute.type_("button"),
+            attribute.class("ghost"),
+            event.on_click(Reset),
+          ],
+          [html.text("別のPDF")],
+        ),
+      ]),
+    ]),
+    html.div([attribute.class("target-input-row")], [
+      html.label([attribute.class("target-label")], [
+        html.text("分析する曲番号"),
+      ]),
+      html.input([
+        attribute.type_("text"),
+        attribute.id("targets"),
+        attribute.class("target-input"),
+        attribute.placeholder("例: 32 または 32,33,34 / 32-34"),
+        attribute.value(model.target_input),
+        event.on_input(fn(value) { TargetInputChanged(value) }),
+      ]),
+      html.span([attribute.class("muted small")], [
+        html.text("カンマ区切り・範囲指定（32-34）が使えます。番号ごとに分析します。"),
+      ]),
+    ]),
+    html.div([attribute.class("page-grid")], {
+      info.thumbs
+      |> list.map(fn(thumb) {
+        let selected = list.contains(model.selected, thumb.page)
+        html.label(
+          [
+            attribute.class(case selected {
+              True -> "page-tile selected"
+              False -> "page-tile"
+            }),
+          ],
+          [
+            html.input([
+              attribute.type_("checkbox"),
+              attribute.checked(selected),
+              attribute.class("page-check"),
+              event.on_check(fn(_) { TogglePage(thumb.page) }),
+            ]),
+            html.img([
+              attribute.src(thumb.data_url),
+              attribute.alt("ページ " <> int.to_string(thumb.page)),
+            ]),
+            html.span([attribute.class("page-number")], [
+              html.text("p. " <> int.to_string(thumb.page)),
+            ]),
+          ],
+        )
+      })
+    }),
+    html.div([attribute.class("sticky-bar")], [
+      html.span([], [
+        html.text(
+          int.to_string(count)
+          <> " / "
+          <> int.to_string(info.page_count)
+          <> " ページ選択中",
+        ),
+      ]),
+      html.button(
+        [
+          attribute.type_("button"),
+          attribute.class("primary"),
+          attribute.disabled(
+            count == 0 || string.is_empty(string.trim(model.target_input)),
+          ),
+          event.on_click(BeginLocate),
+        ],
+        [html.text("対象曲を探す")],
+      ),
+    ]),
+  ])
+}
+
+fn view_locating(model: Model) -> Element(Msg) {
+  html.section([attribute.class("card centered")], [
+    html.div([attribute.class("spinner"), attribute.aria_busy(True)], []),
+    html.h2([], [html.text("対象曲を探しています")]),
+    case model.locate_active {
+      Some(page) ->
+        html.p([attribute.class("muted")], [
+          html.text("ページ " <> int.to_string(page) <> " を確認中…"),
+        ])
+      None -> html.p([attribute.class("muted")], [html.text("準備中…")])
+    },
+    html.p([attribute.class("muted small")], [
+      html.text("ページ全体の低解像度画像から、曲番号の位置だけを判定します。"),
+    ]),
+  ])
+}
+
+fn view_located(model: Model) -> Element(Msg) {
+  let found = found_count(model.targets)
+
+  html.section([attribute.class("card")], [
+    html.h2([], [html.text("対象曲の位置")]),
+    html.p([attribute.class("muted")], [
+      html.text("見つかった段だけを高解像度で書き起こします。"),
+    ]),
+    html.div([attribute.class("target-list")], {
+      model.targets
+      |> list.map(fn(target) {
+        let is_missing = case target.status {
+          Missing -> True
+          _ -> False
+        }
+        html.div(
+          [
+            attribute.class(case is_missing {
+              True -> "target-row missing"
+              False -> "target-row"
+            }),
+          ],
+          [
+            html.strong([], [html.text("No." <> target.number)]),
+            html.span([attribute.class("muted")], [
+              html.text(case is_missing {
+                True -> "このページには見つかりませんでした"
+                False -> systems_summary(target)
+              }),
+            ]),
+          ],
+        )
+      })
+    }),
+    html.div([attribute.class("sticky-bar")], [
+      html.span([], [
+        html.text(int.to_string(found) <> " 曲を書き起こします"),
+      ]),
+      html.div([attribute.class("button-row")], [
+        html.button(
+          [attribute.type_("button"), event.on_click(BackToSelecting)],
+          [html.text("選択に戻る")],
+        ),
+        html.button(
+          [
+            attribute.type_("button"),
+            attribute.class("primary"),
+            attribute.disabled(found == 0),
+            event.on_click(BeginTranscription),
+          ],
+          [html.text("書き起こしを開始")],
+        ),
+      ]),
+    ]),
+  ])
+}
+
+fn view_transcribing(model: Model) -> Element(Msg) {
+  html.section([attribute.class("card centered")], [
+    html.div([attribute.class("spinner"), attribute.aria_busy(True)], []),
+    html.h2([], [html.text("譜面を書き起こしています")]),
+    html.p([attribute.class("progress-text")], [
+      html.text(
+        int.to_string(model.transcribe_done)
+        <> " / "
+        <> int.to_string(model.transcribe_total)
+        <> " ページ完了",
+      ),
+    ]),
+    case model.transcribe_active {
+      Some(pair) -> {
+        let #(number, page) = pair
+        html.p([attribute.class("muted")], [
+          html.text(
+            "No." <> number <> " / ページ " <> int.to_string(page) <> " を解析中…",
+          ),
+        ])
+      }
+      None -> html.p([attribute.class("muted")], [html.text("準備中…")])
+    },
+    html.div([attribute.class("progress")], [
+      html.div(
+        [
+          attribute.class("progress-fill"),
+          attribute.style(
+            "width",
+            progress_percent(model.transcribe_done, model.transcribe_total),
+          ),
+        ],
+        [],
+      ),
+    ]),
+    html.p([attribute.class("muted small")], [
+      html.text("対象曲の段を分割して送信します。1ページあたり数十秒かかることがあります。"),
+    ]),
+  ])
+}
+
+fn progress_percent(done: Int, total: Int) -> String {
+  case total {
+    0 -> "0%"
+    _ -> int.to_string(done * 100 / total) <> "%"
+  }
+}
+
+fn view_analyzing(model: Model) -> Element(Msg) {
+  html.section([attribute.class("card centered")], [
+    html.div([attribute.class("spinner"), attribute.aria_busy(True)], []),
+    html.h2([], [html.text("和声を分析しています")]),
+    html.p([attribute.class("progress-text")], [
+      html.text(
+        int.to_string(model.analyze_done)
+        <> " / "
+        <> int.to_string(model.analyze_total)
+        <> " 曲完了",
+      ),
+    ]),
+    case model.active_target {
+      Some(number) ->
+        html.p([attribute.class("muted")], [
+          html.text("No." <> number <> " を分析中…"),
+        ])
+      None -> html.p([attribute.class("muted")], [html.text("準備中…")])
+    },
+    html.div([attribute.class("progress")], [
+      html.div(
+        [
+          attribute.class("progress-fill"),
+          attribute.style(
+            "width",
+            progress_percent(model.analyze_done, model.analyze_total),
+          ),
+        ],
+        [],
+      ),
+    ]),
+    html.p([attribute.class("muted small")], [
+      html.text("1曲ごとに quota を1回消費します。失敗した場合は自動で戻ります。"),
+    ]),
+  ])
+}
+
+fn view_done(model: Model) -> Element(Msg) {
+  html.section([attribute.class("result")], [
+    html.div([attribute.class("result-head")], [
+      html.div([], [
+        html.h2([], [html.text("和声分析")]),
+        html.p([attribute.class("muted")], [
+          html.text("番号ごとに結果を表示しています。"),
+        ]),
+      ]),
+      html.div([attribute.class("button-row")], [
+        html.button([attribute.type_("button"), event.on_click(Print)], [
+          html.text("印刷"),
+        ]),
+        html.button(
+          [
+            attribute.type_("button"),
+            attribute.class("primary"),
+            event.on_click(Reset),
+          ],
+          [html.text("別のPDFを分析")],
+        ),
+      ]),
+    ]),
+    ..list.map(model.targets, fn(target) { view_target_result(target) })
+  ])
+}
+
+fn view_target_result(target: Target) -> Element(Msg) {
+  case target.status {
+    Missing ->
+      html.div([attribute.class("target-warning")], [
+        html.strong([], [html.text("No." <> target.number)]),
+        html.span([], [html.text(" は見つかりませんでした。")]),
+      ])
+    FailedTarget ->
+      html.div([attribute.class("target-warning")], [
+        html.strong([], [html.text("No." <> target.number)]),
+        html.span([], [html.text(" の分析に失敗しました: " <> target.error)]),
+      ])
+    QuotaExceeded ->
+      html.div([attribute.class("target-warning")], [
+        html.strong([], [html.text("No." <> target.number)]),
+        html.span([], [html.text(" は quota 不足のため未分析です。")]),
+      ])
+    TargetDone ->
+      case target.analysis {
+        Some(analysis) ->
+          html.div([attribute.class("target-result")], [
+            html.h2([], [html.text("No." <> target.number)]),
+            view_analysis(analysis),
+          ])
+        None -> html.div([], [])
+      }
+    _ -> html.div([], [])
+  }
+}
+
+fn view_analysis(analysis: shared.Analysis) -> Element(Msg) {
+  html.div([attribute.class("analysis-body")], [
+    case analysis.meta.mock {
+      True ->
+        html.div([attribute.class("banner banner-mock")], [
+          html.text("モックモードの結果です。DEEPSEEK_API_KEY を設定すると実際の解析に切り替わります。"),
+        ])
+      False -> html.div([attribute.class("hidden")], [])
+    },
+    html.div([attribute.class("meta-grid")], [
+      meta_card("調性", analysis.meta.key),
+      meta_card("拍子", analysis.meta.meter),
+      meta_card("形式", analysis.meta.form),
+      meta_card("自信度", analysis.meta.confidence),
+    ]),
+    html.div([attribute.class("table-wrap")], [
+      html.table([attribute.class("harmony-table")], [
+        html.thead([], [
+          html.tr([], [
+            th("小節"),
+            th("拍"),
+            th("和音"),
+            th("機能"),
+            th("構成音"),
+            th("メモ"),
+          ]),
+        ]),
+        html.tbody([], {
+          analysis.table
+          |> list.map(fn(row) {
+            html.tr([], [
+              td(row.bar),
+              td(row.beat),
+              td(row.chord),
+              td(row.function),
+              td(row.notes),
+              td(row.comment),
+            ])
+          })
+        }),
+      ]),
+    ]),
+    html.article([attribute.class("prose")], [
+      html.h3([], [html.text("分析")]),
+      ..prose_paragraphs(analysis.prose)
+    ]),
+  ])
+}
+
+fn meta_card(label: String, value: String) -> Element(Msg) {
+  let shown = case value {
+    "" -> "—"
+    _ -> value
+  }
+  html.div([attribute.class("meta-card")], [
+    html.span([attribute.class("meta-label")], [html.text(label)]),
+    html.strong([], [html.text(shown)]),
+  ])
+}
+
+fn th(label: String) -> Element(Msg) {
+  html.th([attribute.scope("col")], [html.text(label)])
+}
+
+fn td(value: String) -> Element(Msg) {
+  html.td([], [html.text(value)])
+}
+
+fn prose_paragraphs(prose: String) -> List(Element(Msg)) {
+  prose
+  |> string.split("\n")
+  |> list.filter(fn(line) { !string.is_empty(string.trim(line)) })
+  |> list.map(fn(line) { html.p([], [html.text(string.trim(line))]) })
+}
+
+fn view_failed(model: Model) -> Element(Msg) {
+  html.section([attribute.class("card centered")], [
+    html.h2([], [html.text("処理を続けられませんでした")]),
+    html.p([attribute.class("muted")], [
+      html.text(case model.error {
+        "" -> "不明なエラーが発生しました。"
+        message -> message
+      }),
+    ]),
+    html.div([attribute.class("button-row center")], [
+      html.button([attribute.type_("button"), event.on_click(Reset)], [
+        html.text("最初からやり直す"),
+      ]),
+    ]),
+  ])
+}
+
+// APP -------------------------------------------------------------------------
+
+pub fn main() {
+  let app =
+    lustre.application(
+      init: fn(_) { #(initial_model(), effect.none()) },
+      update:,
+      view:,
+    )
+
+  let assert Ok(_) = lustre.start(app, "#app", Nil)
+  Nil
+}

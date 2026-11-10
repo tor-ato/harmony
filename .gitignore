@@ -1,0 +1,15 @@
+*.beam
+*.ez
+/build
+erl_crash.dump
+
+# harmony service
+.dev.vars
+.wrangler/
+node_modules/
+dist/
+assets/pdf.worker.min.mjs
+
+# deployment credentials / generated state
+.cf-api-token
+.access-setup.json

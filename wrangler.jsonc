@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "harmony",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "harmony",
+      "database_id": "d2eddcef-c175-45bb-b67a-bac4eb0ca0ae",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "MONTHLY_LIMIT": "10",
+    "POLICY_AUD": "9c8077e8ea5e5c3138b344df3e8ca777fafd9d51581cc883d6ee0a4e881da91f",
+    "TEAM_DOMAIN": "flat-violet-ccd3.cloudflareaccess.com",
+    "DEEPSEEK_BASE_URL": "https://opencode.ai/inference/go/openai/v1",
+    "DEEPSEEK_MODEL": "deepseek-v4.1-flash",
+    "TRANSCRIBE_BASE_URL": "https://opencode.ai/inference/go/openai/v1",
+    "TRANSCRIBE_MODEL": "gemini-4-argon",
+    "MOCK_LLM": "false"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
