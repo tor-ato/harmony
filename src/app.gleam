@@ -20,7 +20,9 @@ const app_version = "2026-11-11.1"
 
 const max_parallel_transcriptions = 3
 
-const max_systems_per_request = 12
+// Keep a whole page in one model call. The API also caps the payload, so this
+// only splits pathologically dense pages (and 20 systems is already unusual).
+const max_systems_per_request = 20
 
 // MODEL -----------------------------------------------------------------------
 

@@ -25,7 +25,7 @@ const max_locate_image_chars = 4_000_000
 
 const max_total_text = 200_000
 
-const max_parts_per_request = 12
+const max_parts_per_request = 20
 
 const max_targets = 20
 
