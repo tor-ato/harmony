@@ -99,6 +99,13 @@ fn text_message(role: String, content: String) -> json.Json {
   ])
 }
 
+fn image_part(data_url: String) -> json.Json {
+  json.object([
+    #("type", json.string("image_url")),
+    #("image_url", json.object([#("url", json.string(data_url))])),
+  ])
+}
+
 fn vision_message(prompt: String, data_url: String) -> json.Json {
   json.object([
     #("role", json.string("user")),
@@ -110,14 +117,24 @@ fn vision_message(prompt: String, data_url: String) -> json.Json {
             #("type", json.string("text")),
             #("text", json.string(prompt)),
           ]),
-          json.object([
-            #("type", json.string("image_url")),
-            #("image_url", json.object([#("url", json.string(data_url))])),
-          ]),
+          image_part(data_url),
         ],
         fn(value) { value },
       ),
     ),
+  ])
+}
+
+fn vision_message_many(prompt: String, data_urls: List(String)) -> json.Json {
+  let text =
+    json.object([
+      #("type", json.string("text")),
+      #("text", json.string(prompt)),
+    ])
+  let images = list.map(data_urls, image_part)
+  json.object([
+    #("role", json.string("user")),
+    #("content", json.array([text, ..images], fn(value) { value })),
   ])
 }
 
@@ -204,7 +221,7 @@ fn call(
 
 fn api_error(status: Int, body: String) -> String {
   case status {
-    402 -> "OpenCode Console の残高が不足しています。Settings → Billing からクレジットを追加してください。"
+    402 -> "モデル API の残高が不足しています。OpenCode Go のクレジットを確認してください。"
     401 -> "モデル API キーが無効です。DEEPSEEK_API_KEY の設定を確認してください。"
     429 -> "モデル API のレート制限に達しました。少し待ってから再試行してください。"
     _ -> {
@@ -224,24 +241,24 @@ fn truncate(text: String, limit: Int) -> String {
   }
 }
 
-pub fn transcribe(
+pub fn transcribe_page(
   env: worker_ffi.Env,
   session_id: String,
   page: Int,
   number: String,
-  label: String,
-  index: Int,
-  total: Int,
-  data_url: String,
+  labels: List(String),
+  document_pages: Int,
+  images: List(#(String, String)),
 ) -> Promise(Result(String, String)) {
   case mock_enabled(env) {
     True -> promise.resolve(Ok(mock_transcription(page)))
     False -> {
+      let data_urls = list.map(images, fn(image) { image.1 })
       let messages = [
         text_message("system", "あなたは正確な楽譜の読み取りを得意とする音楽理論の専門家です。"),
-        vision_message(
-          prompts.transcribe_prompt(page, number, label, index, total),
-          data_url,
+        vision_message_many(
+          prompts.transcribe_page_prompt(page, labels, number, document_pages),
+          data_urls,
         ),
       ]
 
@@ -275,6 +292,7 @@ pub fn analyze(
   session_id: String,
   number: String,
   text: String,
+  title: String,
 ) -> Promise(Result(String, String)) {
   case mock_enabled(env) {
     True -> promise.resolve(Ok(mock_analysis()))
@@ -284,10 +302,10 @@ pub fn analyze(
           "system",
           "あなたはプロの音楽理論家です。与えられた譜面の書き起こしだけを根拠に、正確で簡潔な和声分析を日本語で作ります。",
         ),
-        text_message("user", prompts.analyze_prompt(number, text)),
+        text_message("user", prompts.analyze_prompt(number, text, title)),
       ]
 
-      call(env, model(env), base_url(env), messages, 8000, True, session_id)
+      call(env, model(env), base_url(env), messages, 12_000, True, session_id)
       |> promise.map(fn(result) {
         case result {
           Ok(content) -> Ok(shared.strip_code_fence(content))

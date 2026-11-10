@@ -697,6 +697,69 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
+/* Analysis mode ----------------------------------------------------------- */
+
+.mode-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 14px;
+}
+
+.mode-tab {
+  background: #fffdf8;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 16px;
+}
+
+.mode-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.input-examples {
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: #fffdf8;
+  font-size: 13px;
+}
+
+.input-examples .examples-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+  color: var(--accent-dark);
+}
+
+.input-examples ul {
+  margin: 0 0 6px;
+  padding-left: 20px;
+  color: var(--ink);
+}
+
+.input-examples li {
+  margin: 3px 0;
+}
+
+.banner-warn {
+  background: var(--warn-soft);
+  border: 1px solid #e8c9a7;
+  color: var(--warn);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.banner-warn p {
+  margin: 0;
+}
+
 @media print {
   .target-warning {
     display: none;

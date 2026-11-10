@@ -43,7 +43,7 @@ pub fn handle(
         200,
         json.object([
           #("ok", json.bool(True)),
-          #("version", json.string("2026-11-10.4")),
+          #("version", json.string("2026-11-11.1")),
         ]),
       ))
 
@@ -300,6 +300,7 @@ type TranscribeBody {
     doc_id: String,
     page: Int,
     number: String,
+    document_pages: Int,
     parts: List(TranscribePart),
   )
 }
@@ -314,8 +315,15 @@ fn transcribe_body_decoder() -> decode.Decoder(TranscribeBody) {
   use doc_id <- decode.field("doc_id", decode.string)
   use page <- decode.field("page", decode.int)
   use number <- decode.field("number", decode.string)
+  use document_pages <- decode.optional_field("document_pages", 1, decode.int)
   use parts <- decode.field("parts", decode.list(transcribe_part_decoder()))
-  decode.success(TranscribeBody(doc_id:, page:, number:, parts:))
+  decode.success(TranscribeBody(
+    doc_id:,
+    page:,
+    number:,
+    document_pages:,
+    parts:,
+  ))
 }
 
 type ValidTranscribe {
@@ -323,6 +331,7 @@ type ValidTranscribe {
     doc_id: String,
     page: Int,
     number: String,
+    document_pages: Int,
     parts: List(#(String, String)),
   )
 }
@@ -348,51 +357,17 @@ fn run_transcribe(
   env: worker_ffi.Env,
   valid: ValidTranscribe,
 ) -> Promise(Dynamic) {
-  let total = list.length(valid.parts)
+  let labels = list.map(valid.parts, fn(part) { part.0 })
 
-  let labelled_promises =
-    valid.parts
-    |> list.index_map(fn(part, index) {
-      let #(label, data_url) = part
-      #(
-        label,
-        llm.transcribe(
-          env,
-          valid.doc_id,
-          valid.page,
-          valid.number,
-          label,
-          index + 1,
-          total,
-          data_url,
-        ),
-      )
-    })
-
-  labelled_promises
-  |> list.map(fn(pair) { pair.1 })
-  |> promise.await_list
-  |> promise.map(fn(results) {
-    list.zip(labelled_promises, results)
-    |> list.map(fn(pair) {
-      let #(#(label, _promise), result) = pair
-      case result {
-        Ok(text) -> Ok("【" <> label <> "】\n" <> text)
-        Error(message) -> Error(message)
-      }
-    })
-    |> list.fold(Ok(""), fn(accumulated, item) {
-      case accumulated, item {
-        Ok(text), Ok(section) ->
-          Ok(case text {
-            "" -> section
-            _ -> text <> "\n\n" <> section
-          })
-        Error(message), _ -> Error(message)
-        _, Error(message) -> Error(message)
-      }
-    })
-  })
+  llm.transcribe_page(
+    env,
+    valid.doc_id,
+    valid.page,
+    valid.number,
+    labels,
+    valid.document_pages,
+    valid.parts,
+  )
   |> promise.await(fn(result) {
     case result {
       Error(message) -> promise.resolve(error_response(502, message))
@@ -434,10 +409,16 @@ fn validate_transcribe(
 ) -> Result(ValidTranscribe, String) {
   use _ <- result.try(validate_doc_id(body.doc_id))
   use _ <- result.try(validate_page(body.page))
-  use number <- result.try(case normalize_number(body.number) {
+  use number <- result.try(case normalize_target(body.number) {
     Some(number) -> Ok(number)
     None -> Error("曲番号が不正です")
   })
+  use _ <- result.try(
+    case body.document_pages >= 1 && body.document_pages <= 2000 {
+      True -> Ok(Nil)
+      False -> Error("ページ数が不正です")
+    },
+  )
   use _ <- result.try({
     let count = list.length(body.parts)
     case count == 0 {
@@ -471,6 +452,7 @@ fn validate_transcribe(
     doc_id: body.doc_id,
     page: body.page,
     number:,
+    document_pages: body.document_pages,
     parts: list.index_map(parts, fn(part, index) {
       let label = case string.trim(part.label) {
         "" -> "部分" <> int.to_string(index + 1)
@@ -499,18 +481,19 @@ fn validate_part(part: TranscribePart) -> Result(Nil, String) {
 // FINALIZE --------------------------------------------------------------------
 
 type FinalizeBody {
-  FinalizeBody(doc_id: String, number: String, text: String)
+  FinalizeBody(doc_id: String, number: String, title: String, text: String)
 }
 
 fn finalize_body_decoder() -> decode.Decoder(FinalizeBody) {
   use doc_id <- decode.field("doc_id", decode.string)
   use number <- decode.field("number", decode.string)
+  use title <- decode.optional_field("title", "", decode.string)
   use text <- decode.field("text", decode.string)
-  decode.success(FinalizeBody(doc_id:, number:, text:))
+  decode.success(FinalizeBody(doc_id:, number:, title:, text:))
 }
 
 type ValidFinalize {
-  ValidFinalize(doc_id: String, number: String, text: String)
+  ValidFinalize(doc_id: String, number: String, title: String, text: String)
 }
 
 fn handle_finalize(
@@ -550,7 +533,13 @@ fn run_finalize(env: worker_ffi.Env, valid: ValidFinalize) -> Promise(Dynamic) {
                     <> "回）に達しました。来月またお試しください。",
                 ))
               True ->
-                llm.analyze(env, valid.doc_id, valid.number, valid.text)
+                llm.analyze(
+                  env,
+                  valid.doc_id,
+                  valid.number,
+                  valid.text,
+                  valid.title,
+                )
                 |> promise.await(fn(analysis_result) {
                   case analysis_result {
                     Error(message) ->
@@ -581,9 +570,16 @@ fn run_finalize(env: worker_ffi.Env, valid: ValidFinalize) -> Promise(Dynamic) {
 
 fn validate_finalize(body: FinalizeBody) -> Result(ValidFinalize, String) {
   use _ <- result.try(validate_doc_id(body.doc_id))
-  use number <- result.try(case normalize_number(body.number) {
+  use number <- result.try(case normalize_target(body.number) {
     Some(number) -> Ok(number)
     None -> Error("曲番号が不正です")
+  })
+  use title <- result.try({
+    let title = string.trim(body.title)
+    case string.length(title) <= 120 {
+      True -> Ok(title)
+      False -> Error("曲名が長すぎます")
+    }
   })
   use _ <- result.try(case string.length(string.trim(body.text)) {
     0 -> Error("書き起こしが空です")
@@ -594,7 +590,7 @@ fn validate_finalize(body: FinalizeBody) -> Result(ValidFinalize, String) {
     False -> Error("書き起こしが長すぎます")
   })
 
-  Ok(ValidFinalize(doc_id: body.doc_id, number:, text: body.text))
+  Ok(ValidFinalize(doc_id: body.doc_id, number:, title:, text: body.text))
 }
 
 fn release_then(
@@ -656,6 +652,17 @@ fn normalize_number(value: String) -> Option(String) {
   case int.parse(cleaned) {
     Ok(number) if number > 0 -> Some(int.to_string(number))
     _ -> None
+  }
+}
+
+/// Piece numbers are digits, or "ALL" for whole-document mode.
+fn normalize_target(value: String) -> Option(String) {
+  let cleaned = string.trim(value)
+  case string.uppercase(cleaned) {
+    "ALL" -> Some("ALL")
+    "PDF全体" -> Some("ALL")
+    "全体" -> Some("ALL")
+    _ -> normalize_number(cleaned)
   }
 }
 

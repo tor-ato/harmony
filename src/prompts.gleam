@@ -4,39 +4,73 @@ import gleam/int
 import gleam/list
 import gleam/string
 
-pub fn transcribe_prompt(
+pub fn transcribe_page_prompt(
   page: Int,
+  labels: List(String),
   number: String,
-  label: String,
-  index: Int,
-  total: Int,
+  document_pages: Int,
 ) -> String {
-  let image = case total {
-    1 ->
-      "印刷楽譜の "
-      <> int.to_string(page)
-      <> " ページ目から切り出した高解像度クロップ（"
-      <> label
-      <> "）"
-    _ ->
-      "印刷楽譜の "
-      <> int.to_string(page)
-      <> " ページ目にある "
-      <> int.to_string(total)
-      <> " 段のうち "
-      <> int.to_string(index)
-      <> " 段目だけを、左端から右端まで切り出した高解像度クロップ（"
-      <> label
-      <> "）"
+  let whole = number == "ALL"
+  let count = list.length(labels)
+  let listing =
+    labels
+    |> list.index_map(fn(label, index) {
+      int.to_string(index + 1) <> ". " <> label
+    })
+    |> string.join("\n")
+
+  let subject = case whole {
+    True ->
+      case document_pages {
+        1 -> "この文書全体（1ページの作品）"
+        _ ->
+          "1つの作品の一部（全 "
+          <> int.to_string(document_pages)
+          <> " ページ中の "
+          <> int.to_string(page)
+          <> " ページ目）"
+      }
+    False -> "No." <> number
   }
 
-  "あなたはプロの音楽理論家兼アーキビストです。添付画像は"
-  <> image
-  <> "です。対象は No."
-  <> number
-  <> " だけです。同じページの他の番号の曲は無視してください。
+  let other = case whole {
+    True -> "画像内の段はすべて同じ作品の一部として扱ってください。"
+    False -> "同じページの他の番号の曲は無視してください。"
+  }
 
-画像は鮮明な部分拡大で、1枚に1段ぶんがすべて入っています。読める音は「不明」と書かず、音名を確定してください。画像の粗さ・解像度への言及は不要です。小節は左から順に数え、ラベルに「小節X-Y」が含まれる場合はその番号を全体の小節番号として使ってください。画像の端で切れている小節だけ「切れ」と書き、見えない部分を推測で補わないでください。
+  let numbering = case whole {
+    True ->
+      case document_pages {
+        1 ->
+          "小節番号は、このページの最初の段の1小節目を 1 として、段をまたいで通し番号にしてください。弱起（アウフタクト）があっても 1 から始め、0 や負の番号は使わないでください。"
+        _ ->
+          "小節番号は \"<ページ>-<ページ内の小節番号>\" の形式（例: "
+          <> int.to_string(page)
+          <> "-7）にしてください。ページ内では最初の段の1小節目から数え、段をまたいで続けてください。弱起があってもページ内の最初の小節を 1 とし、0 は使わないでください。"
+      }
+    False -> "ラベルに「小節X-Y」がある場合は、その番号を全体の小節番号として使ってください。"
+  }
+
+  "あなたはプロの音楽理論家兼アーキビストです。添付画像は印刷楽譜の "
+  <> int.to_string(page)
+  <> " ページ目にある "
+  <> int.to_string(count)
+  <> " 段を、上から順に並べたものです。対象は"
+  <> subject
+  <> "です。"
+  <> other
+  <> "
+
+画像は上から順に:
+"
+  <> listing
+  <> "
+
+画像は鮮明な部分拡大で、1枚に1段ぶんがすべて入っています。読める音は「不明」と書かず、音名を確定してください。画像の粗さ・解像度への言及は不要です。小節は左から順に数えてください。段の右端で切れている小節だけ「切れ」と書き、見えない部分を推測で補わないでください。全画像を1つの曲として読み、画像ごとに結果を分けず、1つのJSONにまとめてください。
+
+"
+  <> numbering
+  <> "
 
 出力は次のJSONのみとしてください。コードフェンスや前後の説明文は禁止です。
 
@@ -45,7 +79,7 @@ pub fn transcribe_prompt(
   \"meter\": \"拍子（例: 3/4。見えない場合は空文字）\",
   \"bars\": [
     {
-      \"bar\": \"小節番号（全体番号。例: 1）\",
+      \"bar\": \"小節番号\",
       \"beat\": \"拍（例: 1、2、3）\",
       \"chord\": \"和音（例: G7/D、F/C。不明なら「不明」）\",
       \"notes\": \"構成音（例: D-G-B♮-F）\",
@@ -58,19 +92,42 @@ pub fn transcribe_prompt(
 }
 
 ルール:
-- bars はこの画像で読める小節だけ。全体の小節番号を使う。
+- bar は指定の番号形式だけを使う（1 以上の整数、または pN-M）。0 や負の番号は使わない。
+- bars は画像に写っている小節を、指定の番号形式で1回ずつ入れる。同じ小節を重複させない。
 - 読めた音を uncertain に入れない。不明な音だけ uncertain に書く。
 - 説明は簡潔に。同じ注意書きを繰り返さない。"
 }
 
-pub fn analyze_prompt(number: String, text: String) -> String {
-  "あなたはプロの音楽理論家です。以下は印刷楽譜の No."
-  <> number
-  <> " を高解像度で書き起こしたものです。以下は各クロップのJSON書き起こしを含みます。重複する小節を統合し、全体の小節番号で表を作り、曲全体の和声分析を日本語で行ってください。
+pub fn analyze_prompt(number: String, text: String, title: String) -> String {
+  let whole = number == "ALL"
+  let subject = case whole {
+    True ->
+      case string.trim(title) {
+        "" -> "印刷楽譜の1作品"
+        name -> "印刷楽譜の「" <> name <> "」"
+      }
+    False -> "印刷楽譜の No." <> number
+  }
+
+  let intro = case whole {
+    True ->
+      subject
+      <> " を、ページごとの高解像度書き起こし（JSON）として渡します。複数ページにまたがる場合は、ページをまたいだ偽の通し小節番号を作らず、書き起こしの表記（例: 3-7）をそのまま使ってください。曲全体を1つの作品として和声分析し、日本語で説明してください。
 
 "
-  <> string.trim(text)
-  <> "
+    False ->
+      subject
+      <> " を高解像度で書き起こしたものです。以下は各クロップのJSON書き起こしを含みます。重複する小節を統合し、全体の小節番号で表を作り、曲全体の和声分析を日本語で行ってください。
+
+"
+  }
+
+  let numbering_rule = case whole {
+    True -> "- table の bar は書き起こしの表記をそのまま使う。ページをまたいだ通し番号は作らない。\n"
+    False -> ""
+  }
+
+  "あなたはプロの音楽理論家です。" <> intro <> string.trim(text) <> "
 
 出力は次の形式のJSONオブジェクトのみとしてください。コードフェンス（```）や前後の説明文は禁止です。
 
@@ -84,7 +141,7 @@ pub fn analyze_prompt(number: String, text: String) -> String {
   },
   \"table\": [
     {
-      \"bar\": \"通し小節番号（例: 1）\",
+      \"bar\": \"小節番号（例: 1）\",
       \"beat\": \"拍（例: 1、1-3、4）\",
       \"chord\": \"和音（例: F、C/E、B♭）\",
       \"function\": \"機能（T / SD / D / Tp など。日本語でも可）\",
@@ -96,7 +153,7 @@ pub fn analyze_prompt(number: String, text: String) -> String {
 }
 
 ルール:
-- table は主要な和音変化のある小節・拍に絞る。全拍を機械的に埋めない。
+" <> numbering_rule <> "- table は主要な和音変化のある小節・拍に絞る。全拍を機械的に埋めない。
 - 記述にない小節を捏造しない。不明な箇所は chord を「不明」とし、prose でも不明と書く。
 - 反復記号がある場合は、形式の説明に演奏順（例: A A B A' A'）を明記するが、table は譜面上の小節番号で一度だけ書く。
 - prose は800〜1500字程度。調性、拍子、形式と反復、テクスチュア、旋律・動機、主要な和声進行、転調・借用和音（♭VIなど）、注目すべき箇所、演奏への示唆、様式的位置づけを含める。段落は改行で区切る。

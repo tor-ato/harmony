@@ -287,20 +287,29 @@ export async function render_page_overview(pageNumber) {
   }
 }
 
-export async function render_system_crops(pageNumber, number, indices, bars) {
+export async function render_system_crops(pageNumber, displayName, indices, bars) {
   try {
     if (!pdfDocument) {
       return failure("PDF が読み込まれていません");
     }
-    if (systemCache.page !== pageNumber) {
-      const page = await pdfDocument.getPage(pageNumber);
-      const overview = await renderToCanvas(page, OVERVIEW_WIDTH);
-      page.cleanup();
+
+    // Keep the detected boxes local. Whole-document mode renders several pages
+    // concurrently, so a shared `systemCache` must never be read after an await.
+    let boxes =
+      systemCache.page === pageNumber ? systemCache.boxes : null;
+    let cacheHeight =
+      systemCache.page === pageNumber ? systemCache.height : 0;
+    if (!boxes) {
+      const overviewPage = await pdfDocument.getPage(pageNumber);
+      const overview = await renderToCanvas(overviewPage, OVERVIEW_WIDTH);
+      overviewPage.cleanup();
+      boxes = detectSystemBoxes(overview);
+      cacheHeight = overview.height;
       systemCache = {
         page: pageNumber,
-        boxes: detectSystemBoxes(overview),
+        boxes,
         width: overview.width,
-        height: overview.height,
+        height: cacheHeight,
       };
     }
 
@@ -308,7 +317,7 @@ export async function render_system_crops(pageNumber, number, indices, bars) {
     const source = await renderToCanvas(page, PAGE_WIDTH);
     page.cleanup();
 
-    const scale = source.height / systemCache.height;
+    const scale = source.height / cacheHeight;
     const parts = [];
     const selected = Array.isArray(indices)
       ? indices
@@ -317,7 +326,7 @@ export async function render_system_crops(pageNumber, number, indices, bars) {
         : [];
     const valid = selected
       .map((value) => Number(value))
-      .filter((value) => Number.isInteger(value) && value >= 1 && value <= systemCache.boxes.length);
+      .filter((value) => Number.isInteger(value) && value >= 1 && value <= boxes.length);
     const unique = [...new Set(valid)];
     const barCounts = Array.isArray(bars)
       ? bars
@@ -329,7 +338,7 @@ export async function render_system_crops(pageNumber, number, indices, bars) {
     for (let position = 0; position < unique.length; position += 1) {
       const index = unique[position];
       const barCount = Math.max(0, Number(barCounts[position] ?? 0));
-      const [top, bottom] = systemCache.boxes[index - 1];
+      const [top, bottom] = boxes[index - 1];
       const sourceTop = Math.max(0, Math.floor(top * scale));
       const sourceBottom = Math.min(source.height, Math.ceil(bottom * scale));
       const height = Math.max(20, sourceBottom - sourceTop);
@@ -368,7 +377,7 @@ export async function render_system_crops(pageNumber, number, indices, bars) {
 
       const category = barRange === "" ? `段${index}` : `段${index} / ${barRange}`;
       parts.push({
-        label: `No.${number} / ${category}`,
+        label: `${displayName} / ${category}`,
         data_url: canvas.toDataURL("image/jpeg", 0.9),
       });
 
